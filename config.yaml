@@ -1,0 +1,25 @@
+listen: "0.0.0.0:3000"
+max_body_size: 10485760  # 10MB, 0 means no limit
+
+# Client authentication keys
+api_keys:
+  - dssssssssssssssss
+  - bxxxxxxxxxxxxx
+
+# Global proxy (optional)
+#proxy:
+#  url: socks5://127.0.0.1:1080
+#  url: http://127.0.0.1:8080
+
+providers:
+  - name: gemini-openai
+    path_prefix: /gemini-openai/v1
+    upstream: https://generativelanguage.googleapis.com/v1beta/openai/v1
+    auth_header: Authorization
+    auth_keys:
+      - "Bearer uiiiiiiiiiiiiiiiiiii"
+      - "Bearer b22222222222222"
+    timeout: 30s
+    max_retries: 2
+    #proxy:
+    #  url: socks5://127.0.0.1:1080
