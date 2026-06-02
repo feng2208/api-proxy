@@ -127,14 +127,25 @@ func printBanner(cfg *Config) {
 		fmt.Printf("  Max body size:    %d bytes\n", cfg.MaxBodySize)
 	}
 	fmt.Println(sep)
-	for _, p := range cfg.Providers {
-		proxyInfo := "direct"
-		if p.Proxy.URL != "" {
-			proxyInfo = p.Proxy.URL
+	fmt.Println("  Models:")
+	for _, m := range cfg.Models {
+		fmt.Printf("  - %s (%d providers)\n", m.Name, len(m.Providers))
+		for _, p := range m.Providers {
+			proxyInfo := "direct"
+			if p.Proxy.URL != "" {
+				proxyInfo = p.Proxy.URL
+			}
+			if p.ModelRateLimit > 0 {
+				fmt.Printf("      -> %s: %s (timeout: %s, model_rate_limit: %d/min, proxy: %s)\n", p.Name, p.Model, p.TimeoutDuration, p.ModelRateLimit, proxyInfo)
+			} else {
+				fmt.Printf("      -> %s: %s (timeout: %s, proxy: %s)\n", p.Name, p.Model, p.TimeoutDuration, proxyInfo)
+			}
 		}
-		fmt.Printf("  %-16s %s → %s\n", p.Name, p.PathPrefix, p.Upstream)
-		fmt.Printf("  %16s keys=%d timeout=%s retries=%d proxy=%s\n",
-			"", len(p.AuthKeys), p.TimeoutDuration, p.MaxRetries, proxyInfo)
+	}
+	fmt.Println(sep)
+	fmt.Println("  Auth Providers:")
+	for _, ap := range cfg.Auth.Providers {
+		fmt.Printf("  - %-16s keys=%d global_rate_limit=%d/min\n", ap.Name, len(ap.Keys), ap.RateLimit)
 	}
 	fmt.Println(sep)
 }

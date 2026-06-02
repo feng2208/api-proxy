@@ -9,16 +9,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed config.yaml
+//go:embed config-template.yaml
 var ConfigTemplate string
 
 // Config represents the top-level configuration.
 type Config struct {
-	Listen      string     `yaml:"listen"`
-	MaxBodySize int64      `yaml:"max_body_size"`
-	APIKeys     []string   `yaml:"api_keys"`
-	Proxy       ProxyConfig `yaml:"proxy"`
-	Providers   []Provider `yaml:"providers"`
+	Listen          string        `yaml:"listen"`
+	MaxBodySize     int64         `yaml:"max_body_size"`
+	BasePath        string        `yaml:"base_path"`
+	ClientRateLimit int           `yaml:"client_rate_limit"`
+	APIKeys         []string      `yaml:"api_keys"`
+	Proxy           ProxyConfig   `yaml:"proxy"`
+	Models          []ModelConfig `yaml:"models"`
+	Auth            AuthConfig    `yaml:"auth"`
 }
 
 // ProxyConfig holds proxy connection settings.
@@ -26,19 +29,35 @@ type ProxyConfig struct {
 	URL string `yaml:"url"`
 }
 
-// Provider defines an upstream API provider.
-type Provider struct {
-	Name         string      `yaml:"name"`
-	PathPrefix   string      `yaml:"path_prefix"`
-	Upstream     string      `yaml:"upstream"`
-	AuthHeader   string      `yaml:"auth_header"`
-	AuthKeys     []string    `yaml:"auth_keys"`
-	Timeout      string      `yaml:"timeout"`
-	MaxRetries   int         `yaml:"max_retries"`
-	Proxy        ProxyConfig `yaml:"proxy"`
+// ModelConfig represents a model exposed to the client.
+type ModelConfig struct {
+	Name      string           `yaml:"name"`
+	Providers []ProviderConfig `yaml:"providers"`
+}
 
-	// Parsed fields (not from YAML)
+// ProviderConfig represents a backend provider for a model.
+type ProviderConfig struct {
+	Name           string      `yaml:"name"`
+	Upstream       string      `yaml:"upstream"`
+	Model          string      `yaml:"model"`
+	Timeout        string      `yaml:"timeout"`
+	ModelRateLimit int         `yaml:"model_rate_limit"`
+	Proxy          ProxyConfig `yaml:"proxy"`
+
+	// Parsed fields
 	TimeoutDuration time.Duration `yaml:"-"`
+}
+
+// AuthConfig holds authentication settings for backend providers.
+type AuthConfig struct {
+	Providers []AuthProviderConfig `yaml:"providers"`
+}
+
+// AuthProviderConfig holds keys for a specific provider.
+type AuthProviderConfig struct {
+	Name      string   `yaml:"name"`
+	RateLimit int      `yaml:"rate_limit"`
+	Keys      []string `yaml:"keys"`
 }
 
 // LoadConfig reads and parses the YAML configuration file.
@@ -67,58 +86,90 @@ func applyDefaults(cfg *Config) {
 	if cfg.Listen == "" {
 		cfg.Listen = "0.0.0.0:3000"
 	}
+	if cfg.BasePath == "" {
+		cfg.BasePath = "/v1"
+	}
+	if cfg.ClientRateLimit <= 0 {
+		cfg.ClientRateLimit = 10
+	}
 
-	for i := range cfg.Providers {
-		p := &cfg.Providers[i]
+	for i := range cfg.Models {
+		for j := range cfg.Models[i].Providers {
+			p := &cfg.Models[i].Providers[j]
 
-		if p.Timeout == "" {
-			p.Timeout = "30s"
+			if p.Timeout == "" {
+				p.Timeout = "30s"
+			}
+
+			// Parse timeout duration
+			d, err := time.ParseDuration(p.Timeout)
+			if err != nil {
+				d = 30 * time.Second
+			}
+			p.TimeoutDuration = d
+
+			// Inherit global proxy if provider-level proxy is not set
+			if p.Proxy.URL == "" && cfg.Proxy.URL != "" {
+				p.Proxy.URL = cfg.Proxy.URL
+			}
 		}
+	}
 
-		// max_retries defaults to 2
-		if p.MaxRetries == 0 {
-			p.MaxRetries = 2
-		}
-
-		// Parse timeout duration
-		d, err := time.ParseDuration(p.Timeout)
-		if err != nil {
-			d = 30 * time.Second
-		}
-		p.TimeoutDuration = d
-
-		// Inherit global proxy if provider-level proxy is not set
-		if p.Proxy.URL == "" && cfg.Proxy.URL != "" {
-			p.Proxy.URL = cfg.Proxy.URL
+	for i := range cfg.Auth.Providers {
+		p := &cfg.Auth.Providers[i]
+		if p.RateLimit <= 0 {
+			p.RateLimit = 10
 		}
 	}
 }
 
-// validateConfig checks that all required fields are present.
+// validateConfig checks that all required fields are present and valid.
 func validateConfig(cfg *Config) error {
 	if len(cfg.APIKeys) == 0 {
 		return fmt.Errorf("api_keys must not be empty")
 	}
 
-	if len(cfg.Providers) == 0 {
-		return fmt.Errorf("providers must not be empty")
+	if len(cfg.Models) == 0 {
+		return fmt.Errorf("models must not be empty")
 	}
 
-	for i, p := range cfg.Providers {
-		if p.Name == "" {
-			return fmt.Errorf("provider[%d]: name must not be empty", i)
+	if len(cfg.Auth.Providers) == 0 {
+		return fmt.Errorf("auth.providers must not be empty")
+	}
+
+	authProvidersMap := make(map[string]bool)
+	for i, ap := range cfg.Auth.Providers {
+		if ap.Name == "" {
+			return fmt.Errorf("auth.providers[%d]: name must not be empty", i)
 		}
-		if p.PathPrefix == "" {
-			return fmt.Errorf("provider[%d] %q: path_prefix must not be empty", i, p.Name)
+		if len(ap.Keys) == 0 {
+			return fmt.Errorf("auth.providers[%d] %q: keys must not be empty", i, ap.Name)
 		}
-		if p.Upstream == "" {
-			return fmt.Errorf("provider[%d] %q: upstream must not be empty", i, p.Name)
+		authProvidersMap[ap.Name] = true
+	}
+
+	for i, m := range cfg.Models {
+		if m.Name == "" {
+			return fmt.Errorf("models[%d]: name must not be empty", i)
 		}
-		if p.AuthHeader == "" {
-			return fmt.Errorf("provider[%d] %q: auth_header must not be empty", i, p.Name)
+		if len(m.Providers) == 0 {
+			return fmt.Errorf("models[%d] %q: providers must not be empty", i, m.Name)
 		}
-		if len(p.AuthKeys) == 0 {
-			return fmt.Errorf("provider[%d] %q: auth_keys must not be empty", i, p.Name)
+
+		for j, p := range m.Providers {
+			if p.Name == "" {
+				return fmt.Errorf("models[%d].providers[%d]: name must not be empty", i, j)
+			}
+			if p.Upstream == "" {
+				return fmt.Errorf("models[%d].providers[%d] %q: upstream must not be empty", i, j, p.Name)
+			}
+			if p.Model == "" {
+				return fmt.Errorf("models[%d].providers[%d] %q: model must not be empty", i, j, p.Name)
+			}
+
+			if !authProvidersMap[p.Name] {
+				return fmt.Errorf("models[%d].providers[%d] %q: provider not found in auth.providers", i, j, p.Name)
+			}
 		}
 	}
 

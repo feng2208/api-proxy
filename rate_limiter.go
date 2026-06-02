@@ -9,6 +9,7 @@ import (
 type ClientRateLimiter struct {
 	mu     sync.Mutex
 	limits map[string]*clientLimit
+	limit  int
 }
 
 type clientLimit struct {
@@ -17,14 +18,14 @@ type clientLimit struct {
 }
 
 // NewClientRateLimiter creates a new rate limiter.
-func NewClientRateLimiter() *ClientRateLimiter {
+func NewClientRateLimiter(limit int) *ClientRateLimiter {
 	return &ClientRateLimiter{
 		limits: make(map[string]*clientLimit),
+		limit:  limit,
 	}
 }
 
 // Allow checks if the given API key is allowed to make a request.
-// It limits requests to 10 per minute.
 func (rl *ClientRateLimiter) Allow(apiKey string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -45,7 +46,7 @@ func (rl *ClientRateLimiter) Allow(apiKey string) bool {
 	}
 
 	// Within the same minute window
-	if limit.count >= 10 {
+	if limit.count >= rl.limit {
 		return false
 	}
 

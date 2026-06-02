@@ -40,8 +40,14 @@ func main() {
 	// Print startup banner
 	printBanner(cfg)
 
+	// Initialize shared KeyManagers per auth provider
+	keyManagers := make(map[string]*KeyManager)
+	for _, ap := range cfg.Auth.Providers {
+		keyManagers[ap.Name] = NewKeyManager(ap.Keys, ap.RateLimit)
+	}
+
 	// Build the proxy router and middleware chain
-	router := NewProxyRouter(cfg)
+	router := NewProxyRouter(cfg, keyManagers)
 	handler := buildMiddlewareChain(router, cfg.MaxBodySize)
 
 	// Create HTTP server
