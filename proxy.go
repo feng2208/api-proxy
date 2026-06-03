@@ -57,11 +57,6 @@ type ModelRouter struct {
 	next     uint32
 }
 
-func (mr *ModelRouter) getNextHandler() *ProviderHandler {
-	n := atomic.AddUint32(&mr.next, 1)
-	return mr.handlers[(int(n)-1)%len(mr.handlers)]
-}
-
 // ProxyRouter is the main router for the proxy.
 type ProxyRouter struct {
 	basePath string
@@ -103,7 +98,7 @@ func NewProxyRouter(cfg *Config, keyManagers map[string]*KeyManager) *ProxyRoute
 func writeErrorJSON(w http.ResponseWriter, statusCode int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	
+
 	// OpenAI compatible error format
 	errResp := map[string]interface{}{
 		"error": map[string]interface{}{
@@ -113,7 +108,7 @@ func writeErrorJSON(w http.ResponseWriter, statusCode int, message string) {
 			"code":    nil,
 		},
 	}
-	
+
 	json.NewEncoder(w).Encode(errResp)
 }
 
@@ -123,6 +118,86 @@ func extractBearerToken(r *http.Request) string {
 		return strings.TrimSpace(authHeader[7:])
 	}
 	return authHeader
+}
+
+// authenticate validates client credentials and client-side rate limits.
+func (pr *ProxyRouter) authenticate(r *http.Request) (int, string) {
+	tokenValue := extractBearerToken(r)
+	if tokenValue == "" || !pr.apiKeys[tokenValue] {
+		return http.StatusUnauthorized, "Unauthorized"
+	}
+	if !pr.limiter.Allow(tokenValue) {
+		return http.StatusTooManyRequests, "Too Many Requests"
+	}
+	return 0, ""
+}
+
+// parseRequestBody reads and parses the HTTP request body as JSON.
+func parseRequestBody(r *http.Request) ([]byte, map[string]interface{}, error) {
+	var bodyBytes []byte
+	var err error
+	if r.Body != nil {
+		bodyBytes, err = io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read request body")
+		}
+	}
+
+	var reqBody map[string]interface{}
+	if len(bodyBytes) > 0 {
+		if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+			return nil, nil, fmt.Errorf("invalid json body")
+		}
+	}
+	return bodyBytes, reqBody, nil
+}
+
+// selectProvider chooses the next available provider handler and leases a key.
+func (pr *ProxyRouter) selectProvider(modelRouter *ModelRouter, modelValue string) (*ProviderHandler, string, int, error) {
+	var handler *ProviderHandler
+	var key string
+	var keyIndex int
+	var getErr error
+
+	n := len(modelRouter.handlers)
+	startIndex := int(atomic.AddUint32(&modelRouter.next, 1)-1) % n
+
+	for i := 0; i < n; i++ {
+		h := modelRouter.handlers[(startIndex+i)%n]
+		k, idx, err := h.keyManager.GetKey(modelRouter.modelID, h.config.ModelRateLimit)
+		if err == nil {
+			handler = h
+			key = k
+			keyIndex = idx
+			break
+		}
+		getErr = err
+	}
+
+	if handler == nil {
+		if getErr != nil {
+			return nil, "", -1, getErr
+		}
+		return nil, "", -1, fmt.Errorf("all providers exhausted or rate limited")
+	}
+
+	return handler, key, keyIndex, nil
+}
+
+// rewriteBody updates the requested model with the provider-specific name.
+func rewriteBody(reqBody map[string]interface{}, targetModel string) ([]byte, error) {
+	reqBody["model"] = targetModel
+	return json.Marshal(reqBody)
+}
+
+// buildUpstreamURL formats the final upstream API URL.
+func buildUpstreamURL(upstream, path, rawQuery string) string {
+	url := strings.TrimRight(upstream, "/") + path
+	if rawQuery != "" {
+		url += "?" + rawQuery
+	}
+	return url
 }
 
 func (pr *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -139,45 +214,25 @@ func (pr *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authenticate the client
-	tokenValue := extractBearerToken(r)
-
-	if tokenValue == "" || !pr.apiKeys[tokenValue] {
-		writeErrorJSON(w, http.StatusUnauthorized, "Unauthorized")
-		return
-	}
-
-	if !pr.limiter.Allow(tokenValue) {
-		writeErrorJSON(w, http.StatusTooManyRequests, "Too Many Requests")
+	// 1. Authenticate the client
+	if errCode, errMsg := pr.authenticate(r); errMsg != "" {
+		writeErrorJSON(w, errCode, errMsg)
 		return
 	}
 
 	trimmedPath := strings.TrimPrefix(r.URL.Path, pr.basePath)
 
-	// Handle /v1/models
-	if trimmedPath == "/models" && r.Method == "GET" {
+	// 2. Handle /v1/models metadata endpoint
+	if trimmedPath == "/models" && r.Method == http.MethodGet {
 		pr.handleModels(w)
 		return
 	}
 
-	// Other paths require reading body to extract model
-	var bodyBytes []byte
-	var err error
-	if r.Body != nil {
-		bodyBytes, err = io.ReadAll(r.Body)
-		r.Body.Close()
-		if err != nil {
-			writeErrorJSON(w, http.StatusBadRequest, "failed to read request body")
-			return
-		}
-	}
-
-	var reqBody map[string]interface{}
-	if len(bodyBytes) > 0 {
-		if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
-			writeErrorJSON(w, http.StatusBadRequest, "invalid json body")
-			return
-		}
+	// 3. Parse request payload
+	_, reqBody, err := parseRequestBody(r)
+	if err != nil {
+		writeErrorJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	modelValue, ok := reqBody["model"].(string)
@@ -192,33 +247,28 @@ func (pr *ProxyRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	handler := modelRouter.getNextHandler()
+	// 4. Select provider and lease key with automatic failover
+	handler, key, keyIndex, err := pr.selectProvider(modelRouter, modelValue)
+	if err != nil {
+		log.Printf("model=%s: all providers exhausted or rate limited. Last error: %v", modelValue, err)
+		writeErrorJSON(w, http.StatusServiceUnavailable, "Service Unavailable: all upstream keys exhausted or rate limited")
+		return
+	}
 
-	// Rewrite the model field
-	reqBody["model"] = handler.config.Model
-	newBodyBytes, err := json.Marshal(reqBody)
+	// 5. Rewrite request body
+	newBodyBytes, err := rewriteBody(reqBody, handler.config.Model)
 	if err != nil {
 		writeErrorJSON(w, http.StatusInternalServerError, "failed to rewrite request body")
 		return
 	}
 
-	// Build upstream URL
-	upstreamPath := trimmedPath
-	upstreamURL := strings.TrimRight(handler.config.Upstream, "/") + upstreamPath
-	if r.URL.RawQuery != "" {
-		upstreamURL += "?" + r.URL.RawQuery
-	}
-
-	handler.forwardRequest(w, r, upstreamURL, modelRouter.modelID, newBodyBytes)
+	// 6. Build upstream URL & forward
+	upstreamURL := buildUpstreamURL(handler.config.Upstream, trimmedPath, r.URL.RawQuery)
+	handler.forwardRequest(w, r, upstreamURL, key, keyIndex, newBodyBytes)
 }
 
-func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request, upstreamURL string, modelID string, bodyBytes []byte) {
-	key, keyIndex, err := ph.keyManager.GetKey(modelID, ph.config.ModelRateLimit)
-	if err != nil {
-		log.Printf("provider=%s model=%s: all keys in cooldown or rate limited", ph.config.Name, modelID)
-		writeErrorJSON(w, http.StatusServiceUnavailable, "Service Unavailable: all upstream keys exhausted or rate limited")
-		return
-	}
+func (ph *ProviderHandler) forwardRequest(w http.ResponseWriter, r *http.Request, upstreamURL string, key string, keyIndex int, bodyBytes []byte) {
+	log.Printf("using provider=%s key[%d] for request", ph.config.Name, keyIndex)
 
 	ctx, cancel := context.WithTimeout(r.Context(), ph.config.TimeoutDuration)
 	defer cancel()
