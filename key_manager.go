@@ -33,6 +33,7 @@ type keyRateLimit struct {
 // KeyManager manages key selection, rate limiting, and cooldown for a single provider.
 type KeyManager struct {
 	mu              sync.Mutex
+	providerName    string
 	keys            []string
 	currentIndex    int
 	globalRateLimit int
@@ -42,8 +43,9 @@ type KeyManager struct {
 }
 
 // NewKeyManager creates a new KeyManager for an auth provider.
-func NewKeyManager(keys []string, globalRateLimit int) *KeyManager {
+func NewKeyManager(providerName string, keys []string, globalRateLimit int) *KeyManager {
 	return &KeyManager{
+		providerName:    providerName,
 		keys:            keys,
 		currentIndex:    0,
 		globalRateLimit: globalRateLimit,
@@ -97,10 +99,10 @@ func (km *KeyManager) Mark429(index int) {
 
 	if count >= 3 {
 		km.cooldownMap[index] = nextDayPTCooldown()
-		log.Printf("key[%d]: 3 consecutive 429s, cooldown until next day PT", index)
+		log.Printf("provider=%s key[%d]: 3 consecutive 429s, cooldown until next day PT", km.providerName, index)
 	} else {
 		km.cooldownMap[index] = time.Now().Add(1 * time.Minute)
-		log.Printf("key[%d]: 429 #%d, cooldown for 1 minute", index, count)
+		log.Printf("provider=%s key[%d]: 429 #%d, cooldown for 1 minute", km.providerName, index, count)
 	}
 }
 

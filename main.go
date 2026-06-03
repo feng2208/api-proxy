@@ -43,7 +43,7 @@ func main() {
 	// Initialize shared KeyManagers per auth provider
 	keyManagers := make(map[string]*KeyManager)
 	for _, ap := range cfg.Auth.Providers {
-		keyManagers[ap.Name] = NewKeyManager(ap.Keys, ap.RateLimit)
+		keyManagers[ap.Name] = NewKeyManager(ap.Name, ap.Keys, ap.RateLimit)
 	}
 
 	// Build the proxy router and middleware chain
